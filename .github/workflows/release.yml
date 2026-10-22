@@ -37,7 +37,11 @@ jobs:
   zip:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # write, not read: the last step runs 'gh release create' with this job's token,
+      # which needs contents: write to make a release. The beta.1 run of 2026-10-22 failed
+      # at that step with read (record of unit release-perm, Fault 1). The top level
+      # stays read.
+      contents: write
       # Both are required by actions/attest-build-provenance: it signs with a workflow
       # OIDC token and writes the attestation to the repo's attestation store.
       id-token: write
