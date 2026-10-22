@@ -1,0 +1,159 @@
+name: results
+
+# The results publisher (flag 9: treat every issue as hostile).
+#
+# Anyone on the internet can open an issue on the public repo. Its body is
+# attacker-controlled text, and this workflow can write to the repository that serves the
+# site. So the rules here are not "sanitise the input" - they are:
+#
+#   1. No user text in a run: line, ever. The body is read from the event file as data by
+#      tools/Publish-RigReport.ps1. Nothing here interpolates a title, a body, or a login
+#      into a shell command; the sender's login reaches the script through env:, which is
+#      not parsed as shell.
+#   2. Nothing is downloaded. The report arrives in the issue body. There is no URL to
+#      follow and no artifact to trust.
+#   3. Publish only on `labeled` with the approved label, and only when the sender has
+#      admin or maintain. The label is the decision, so the check is on who added it.
+#   4. An edit to an approved issue removes the label. An approved body that changes
+#      afterwards is not an approved body.
+#   5. Least privilege: contents: read at the top; only the publish job gets contents:
+#      write and issues: write. No secrets. No pull_request_target. Actions pinned to
+#      full SHAs, because a tag can be moved.
+#
+# NOTE: this file exists twice, on purpose. simracer/v4/github/workflows/results.yml is
+# the source of truth the build brief names; .github/workflows/results.yml is the only
+# path GitHub runs a workflow from. A tier A test fails if they drift.
+
+on:
+  issues:
+    types: [labeled, edited]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # An edit after approval takes the approval away. It runs first and on its own, with
+  # only the one permission it needs.
+  unapprove-on-edit:
+    if: github.event.action == 'edited' && contains(join(github.event.issue.labels.*.name, ','), 'approved')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Remove the approved label and say why
+        uses: actions/github-script@10b53a9ec6c222bb4ce97aa6bd2b5f739696b536
+        with:
+          script: |
+            // No shell, and no issue text read into a command. The body is not looked at
+            // here at all: the fact of the edit is the whole input.
+            const issue_number = context.payload.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            try {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: 'approved' });
+            } catch (error) {
+              if (error.status !== 404) { throw error; }
+            }
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: 'The report was edited after approval, so the `approved` label was removed. Nothing was published. Re-approve when the report is final.'
+            });
+
+  publish:
+    if: github.event.action == 'labeled' && github.event.label.name == 'approved'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: What may the sender do here
+        id: who
+        env:
+          # Through env, not into the command line: a login is user-controlled text, and
+          # text that never reaches the shell cannot be a shell problem.
+          SENDER: ${{ github.event.sender.login }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sender = $env:SENDER
+          if ([string]::IsNullOrWhiteSpace($sender)) { throw 'the event carries no sender' }
+          # gh reads the login from a variable, and --jq keeps the answer to one word.
+          $permission = gh api ('repos/{0}/collaborators/{1}/permission' -f $env:GITHUB_REPOSITORY, $sender) --jq '.permission' 2>$null
+          if ([string]::IsNullOrWhiteSpace($permission)) { $permission = 'none' }
+          "permission=$permission" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          ('sender permission: {0}' -f $permission) | Write-Output
+
+      - name: Validate and publish
+        id: publish
+        env:
+          PERMISSION: ${{ steps.who.outputs.permission }}
+        run: |
+          # This one file runs in two repositories with two layouts, because the private
+          # repo is master for the publisher and the public repo is where the issues are
+          # (flag 11). In the private repo the app sits under simracer/v4/; the export
+          # copies it to the public repo's root. So the path is resolved rather than
+          # assumed, and a missing script is a loud failure rather than a silent skip.
+          $candidate = @('./simracer/v4/tools/Publish-RigReport.ps1', './app/tools/Publish-RigReport.ps1', './tools/Publish-RigReport.ps1')
+          $tool = @($candidate | Where-Object { Test-Path -LiteralPath $_ }) | Select-Object -First 1
+          if (-not $tool) { throw ("the publisher is not in this checkout. Looked for: {0}" -f ($candidate -join ', ')) }
+          ('publisher: {0}' -f $tool) | Write-Output
+          # The event file, as data. This is the only thing that reads the issue body, and
+          # it is a PowerShell script with no shell in it.
+          pwsh -NoProfile -File $tool `
+              -EventPath $env:GITHUB_EVENT_PATH `
+              -ResultsPath './site/data/results.json' `
+              -Permission $env:PERMISSION `
+              -CommentPath "$env:RUNNER_TEMP/comment.md"
+          $code = $LASTEXITCODE
+          "code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # 0 published, 1 not ours, 2 refused on content, 3 refused on permission,
+          # 4 usage. Only 4 is a workflow failure: a refused report is this workflow
+          # working, and a red X on every hostile issue would train us to ignore red.
+          if ($code -eq 4) { throw "Publish-RigReport could not run (exit 4)" }
+          exit 0
+
+      - name: Say so on the issue
+        if: steps.publish.outputs.code != '1'
+        uses: actions/github-script@10b53a9ec6c222bb4ce97aa6bd2b5f739696b536
+        with:
+          script: |
+            // The comment body comes from a file the script wrote, with every at-sign
+            // escaped there. It is passed as a value, never spliced into a command.
+            const fs = require('fs');
+            const path = process.env.RUNNER_TEMP + '/comment.md';
+            if (!fs.existsSync(path)) { return; }
+            const body = fs.readFileSync(path, 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body
+            });
+
+      - name: Commit results.json
+        if: steps.publish.outputs.code == '0'
+        env:
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          # The message carries the issue number and nothing the reporter wrote. A commit
+          # subject is not a safe place for a stranger's sentence.
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add site/data/results.json
+          if ((git status --porcelain site/data/results.json).Length -eq 0) {
+              'results.json did not change' | Write-Output
+              exit 0
+          }
+          git commit -m ('results: publish the report from issue #{0}' -f $env:ISSUE)
+          git push
+          # A GITHUB_TOKEN commit does not start other workflows, so the Pages deploy is
+          # not triggered by this push. U4.4 adds the deploy to this job, or a Pages
+          # workflow that also runs on workflow_run. Until then the site is rebuilt by
+          # the next ordinary push, and that is stated rather than assumed.
+          'committed; the Pages deploy is U4.4 and does not happen here yet' | Write-Output

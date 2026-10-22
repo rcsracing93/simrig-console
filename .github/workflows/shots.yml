@@ -1,0 +1,81 @@
+name: screens
+
+# Renders the console's screens to PNG on a Windows runner, so a question like
+# "how does the eight-button strip wrap at 1100 px" can be answered without
+# anyone being at the rig, and answered the same way twice.
+#
+# Not a gate. It never fails the build over what a screen looks like - it just
+# produces pictures and uploads them. The only way it goes red is if the XAML
+# stops parsing, which tier A already catches first.
+#
+# Runs only when something that changes what a screen LOOKS like changes, so it
+# does not add three minutes to every push. That list includes simrig.ico: the
+# icon is on the window and on the About screen, and the first version of it
+# shipped through a full gate reading as a red arrow because this workflow did
+# not run on the commit that drew it. See TS-8.
+
+on:
+  push:
+    branches:
+      - 'simrig/**'
+    paths:
+      - '**/SimRigConsole.View.ps1'
+      - '**/SimRig.Strings.ps1'
+      - '**/simrig.ico'
+      - 'meta/tools/New-SimRigScreenshot.ps1'
+      - '.github/workflows/shots.yml'
+  workflow_dispatch:
+    inputs:
+      width:
+        description: 'Widths to render, comma separated (e.g. 1100,1280,1600)'
+        required: false
+        default: '1100,1280,1600'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    name: Render the screens (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          # The private repo keeps the app at simracer/v4; the public export places it at
+          # app/. One workflow file has to run in both, so the root is resolved, never
+          # assumed. A wrong guess here fails as "file not found" three steps later.
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      - name: Render
+        shell: cmd
+        run: >
+          pwsh -NoProfile -STA -File meta\tools\New-SimRigScreenshot.ps1
+          -AppRoot "${{ steps.where.outputs.app }}"
+          -OutDir shots
+          -Width ${{ github.event.inputs.width || '1100,1280,1600' }}
+
+      - name: What came out
+        shell: pwsh
+        run: |
+          $png = @(Get-ChildItem -LiteralPath shots -Filter *.png -File -ErrorAction SilentlyContinue)
+          if ($png.Count -eq 0) { throw 'no screenshots were produced' }
+          # A PNG that is one flat colour is the classic RenderTargetBitmap
+          # failure: the layout never happened and the file is a blank rectangle.
+          # Better to say so here than to hand someone a picture of nothing.
+          foreach ($file in $png) {
+            '{0,-34} {1,9:n0} bytes' -f $file.Name, $file.Length | Write-Output
+            if ($file.Length -lt 6000) { Write-Output ('  WARNING: {0} is suspiciously small - it may be blank' -f $file.Name) }
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simrig-screens
+          path: shots/*.png
+          if-no-files-found: error

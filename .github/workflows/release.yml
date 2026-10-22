@@ -1,0 +1,196 @@
+name: release
+
+# What this builds, and what it deliberately does not do.
+#
+# It builds the shipping zip from the ship list, writes SHA256SUMS and VERSIONS.md into
+# it, records a build-provenance attestation, and prints the zip's own SHA256 so the
+# release notes and the Install page can show it (spec 11, flag 16).
+#
+# It never publishes. On a tag it creates a DRAFT pre-release and stops there. Making a
+# release public is one of Rick's approval batches, and a workflow that published on its
+# own would take that decision away from him. Nothing here pushes a tag either: the tag
+# is the trigger, never the output.
+#
+# Ubuntu, not Windows, and that is deliberate. .gitattributes normalises .ps1 and .psd1
+# to LF in the repo, and a Windows checkout converts them to CRLF - so a zip built there
+# would carry different bytes, different hashes, and a SHA256 that does not match a zip
+# built anywhere else. The installer verifies the zip against its own SHA256SUMS, so what
+# matters is that one build is reproducible. Tier B proved what line endings cost when
+# nobody decides them: 46 failures on a difference that existed only on disk.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for VERSIONS.md and the zip name (e.g. 4.2.0-beta.1)'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v4.*'
+      - 'v3-classic'
+
+permissions:
+  contents: read
+
+jobs:
+  zip:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Both are required by actions/attest-build-provenance: it signs with a workflow
+      # OIDC token and writes the attestation to the repo's attestation store.
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          # The private repo keeps the app at simracer/v4; the public export places it at
+          # app/. One workflow file has to run in both, so the root is resolved, never
+          # assumed. A wrong guess here fails as "file not found" three steps later.
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      - name: Work out the version and the commit
+        id: what
+        run: |
+          # A tag wins over the input, because a tagged build is the one people download.
+          $tag = '${{ github.ref_name }}'
+          $isTag = '${{ github.ref_type }}' -eq 'tag'
+          $version = if ($isTag) { $tag.TrimStart('v') } else { '${{ inputs.version }}' }
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'no version: pass one to workflow_dispatch, or push a tag' }
+          $commit = '${{ github.sha }}'.Substring(0, 7)
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "commit=$commit" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip=SimRigConsole-$version.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_tag=$($isTag.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "SimRig Console $version from $commit (tag: $isTag)" | Write-Output
+
+      - name: Stage exactly the ship list
+        id: stage
+        run: |
+          # The ship list is the installer's own (Get-SimRigShipItem), not a second copy
+          # in this file. A-INST-10 fails if the console starts hashing a file the list
+          # does not carry, and this staging step is why that matters: what is not staged
+          # is not installed.
+          . ./${{ steps.where.outputs.app }}/engine/Engine.Install.ps1
+          $ship = Get-SimRigShipItem
+          $src = Join-Path $env:GITHUB_WORKSPACE 'release-stage'
+          [void](New-Item -ItemType Directory -Path $src -Force)
+          $generated = @('SHA256SUMS', 'VERSIONS.md')
+          $missing = [System.Collections.Generic.List[string]]::new()
+          foreach ($name in @($ship.File)) {
+              if ($generated -contains $name) { continue }
+              $from = Join-Path '${{ steps.where.outputs.app }}' $name
+              if (-not (Test-Path -LiteralPath $from)) { $missing.Add($name); continue }
+              Copy-Item -LiteralPath $from -Destination (Join-Path $src $name) -Force
+          }
+          foreach ($dir in @($ship.Directory)) {
+              $from = Join-Path '${{ steps.where.outputs.app }}' $dir
+              if (-not (Test-Path -LiteralPath $from)) { $missing.Add($dir + '/'); continue }
+              Copy-Item -LiteralPath $from -Destination (Join-Path $src $dir) -Recurse -Force
+          }
+          if ($missing.Count -gt 0) {
+              throw ("the ship list names files this checkout does not have: {0}. A release built around a missing file is how rules/public-manual.psd1 went missing from every clone." -f ($missing -join ', '))
+          }
+          "src=$src" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          'Staged {0} file(s) and {1} folder(s).' -f @(Get-ChildItem -LiteralPath $src -File).Count, @(Get-ChildItem -LiteralPath $src -Directory).Count | Write-Output
+
+      - name: Nothing private, nothing stale
+        run: |
+          # The zip is what strangers download. Two cheap checks, both about things that
+          # have actually happened in this build: a test folder or a capture riding
+          # along, and a generated file carried in from the checkout.
+          $src = '${{ steps.stage.outputs.src }}'
+          foreach ($name in 'tests', 'fixtures', 'github', '.git') {
+              if (Test-Path -LiteralPath (Join-Path $src $name)) { throw "the staged folder contains $name, which never ships" }
+          }
+          foreach ($pattern in '*.log', '*.etl', '*.csv', 'TRACEABILITY.md') {
+              $hit = @(Get-ChildItem -LiteralPath $src -Filter $pattern -Recurse -File -ErrorAction SilentlyContinue)
+              if ($hit.Count -gt 0) { throw ("the staged folder contains {0}: {1}" -f $pattern, ($hit.Name -join ', ')) }
+          }
+          'staged tree is clean' | Write-Output
+
+      - name: Write SHA256SUMS and VERSIONS.md
+        run: |
+          pwsh -NoProfile -File ./${{ steps.where.outputs.app }}/tools/New-SimRigManifest.ps1 `
+              -SourcePath '${{ steps.stage.outputs.src }}' `
+              -Version '${{ steps.what.outputs.version }}' `
+              -Commit '${{ steps.what.outputs.commit }}'
+          if ($LASTEXITCODE -ne 0) { throw "New-SimRigManifest exited $LASTEXITCODE" }
+          foreach ($name in 'SHA256SUMS', 'VERSIONS.md') {
+              if (-not (Test-Path -LiteralPath (Join-Path '${{ steps.stage.outputs.src }}' $name))) { throw "$name was not written" }
+          }
+          Get-Content -LiteralPath (Join-Path '${{ steps.stage.outputs.src }}' 'VERSIONS.md') -TotalCount 5 | Write-Output
+
+      - name: Zip it, and say what its hash is
+        id: pack
+        run: |
+          $zip = Join-Path $env:GITHUB_WORKSPACE '${{ steps.what.outputs.zip }}'
+          # No leading folder inside the archive: the user extracts the zip and runs
+          # Setup.cmd from where they extracted it, so Setup.cmd has to be at the top.
+          Compress-Archive -Path (Join-Path '${{ steps.stage.outputs.src }}' '*') -DestinationPath $zip -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToUpperInvariant()
+          "zip_path=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # This is the number the release notes and the Install page show, and the one a
+          # careful user checks before running Setup.
+          ('{0}  {1}' -f $hash, (Split-Path $zip -Leaf)) | Write-Output
+          ('zip sha256: {0}' -f $hash) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Setup.cmd is at the top of the archive
+        run: |
+          # A zip whose files sit one folder down is a zip where every install
+          # instruction is wrong. Checked here rather than found by the first user.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead('${{ steps.pack.outputs.zip_path }}')
+          try { $names = @($archive.Entries | ForEach-Object { $_.FullName }) }
+          finally { $archive.Dispose() }
+          foreach ($name in 'Setup.cmd', 'SHA256SUMS', 'VERSIONS.md', 'SimRigConsole.ps1') {
+              if ($names -notcontains $name) { throw "$name is not at the top of the zip" }
+          }
+          ('{0} entries' -f $names.Count) | Write-Output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.what.outputs.zip }}
+          path: ${{ steps.pack.outputs.zip_path }}
+          if-no-files-found: error
+
+      - name: Build-provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ steps.pack.outputs.zip_path }}
+
+      - name: Draft pre-release (tag builds only, never published)
+        if: steps.what.outputs.is_tag == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Draft. A draft is visible only to the repo's maintainers, and publishing it is
+          # one of Rick's approval batches. This workflow's job ends at "ready to look at".
+          $notes = @(
+              ('SimRig Console {0}' -f '${{ steps.what.outputs.version }}'),
+              '',
+              ('Commit: {0}' -f '${{ steps.what.outputs.commit }}'),
+              ('Zip SHA256: {0}' -f '${{ steps.pack.outputs.zip_sha256 }}'),
+              '',
+              'Check the SHA256 above against the zip you downloaded before running Setup.cmd.'
+          ) -join "`n"
+          $notesFile = Join-Path $env:RUNNER_TEMP 'notes.md'
+          Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8
+          gh release create '${{ github.ref_name }}' '${{ steps.pack.outputs.zip_path }}' `
+              --repo '${{ github.repository }}' `
+              --title ('SimRig Console {0}' -f '${{ steps.what.outputs.version }}') `
+              --notes-file $notesFile `
+              --draft --prerelease
+          if ($LASTEXITCODE -ne 0) { throw "gh release create exited $LASTEXITCODE" }
+          'draft pre-release created; publishing is a separate, human decision' | Write-Output

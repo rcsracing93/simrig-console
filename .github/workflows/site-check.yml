@@ -1,0 +1,71 @@
+name: site-check
+
+# The checks the site has to pass before anyone reads it.
+#
+# The rules themselves are in site/tools/site-check.py, in the repository that holds the
+# site - one checker, run the same way here and by a person before committing. A second
+# copy of the rules inside this file would drift from the one that gets run.
+#
+# This workflow lives in the private repo (master for workflow .yml, flag 11) and is
+# exported into the public repo, where site/ actually lives. In the private repo there is
+# no site/ to check, so it says so and stops rather than passing green on nothing - a
+# green check over an absent site is worse than no check.
+
+on:
+  push:
+    paths:
+      - 'site/**'
+      - '.github/workflows/site-check.yml'
+  pull_request:
+    paths:
+      - 'site/**'
+      - '.github/workflows/site-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Is there a site in this checkout
+        id: site
+        shell: bash
+        run: |
+          if [ -d site ] && [ -f site/tools/site-check.py ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No site/ in this repository. The site lives in the public repo; this"
+            echo "workflow is exported there and runs against it. Nothing to check here."
+          fi
+
+      - name: Links, phrases, rendering, chrome and data
+        if: steps.site.outputs.present == 'true'
+        shell: bash
+        run: python3 site/tools/site-check.py site
+
+      - name: JavaScript parses
+        if: steps.site.outputs.present == 'true'
+        shell: bash
+        run: |
+          # node is on the runner. A page whose script does not parse is a page whose
+          # table never draws, and the checker cannot see that with a regex.
+          for file in $(find site -name '*.js'); do
+            node --check "$file"
+            echo "parsed: $file"
+          done
+
+      - name: Contrast, in both themes
+        if: steps.site.outputs.present == 'true'
+        shell: bash
+        run: |
+          # WCAG AA for body text is 4.5:1, and the site is light by default and dark when
+          # the reader's system asks. Both are measured, because a token that reads well in
+          # one theme can fail in the other - which is the whole reason the tokens exist.
+          npm install --no-save playwright@1.48.0 >/dev/null 2>&1
+          npx playwright install --with-deps chromium >/dev/null 2>&1
+          node site/tools/contrast-check.js

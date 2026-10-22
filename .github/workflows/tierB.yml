@@ -1,0 +1,832 @@
+# tierB.yml - SimRig Console v4.2, unit U4.2.
+#
+# Tier B is the gate this build has never passed, because tier A runs on Linux
+# against a simulated Windows (tests/_FakeWindows.ps1). Every service change,
+# registry write, scheduled task and ACL in this app is a decision proved on Linux
+# and an action that has never executed. 1382 passing tests say nothing about that.
+#
+# So these jobs run the real scripts on a real Windows, on a throwaway runner:
+#
+#   lint                  PSScriptAnalyzer with the real module on Windows
+#   tier-a-windows        the whole Pester suite on Windows, no fixtures
+#   manifest-and-install  B-INST-01/02/03: manifest, install, upgrade, uninstall
+#   round-trip            B-FIX-03: quiet, verify, restore, verify, for real
+#   restore-now           B-P13: RESTORE-NOW.cmd from an extracted copy, with no console
+#
+# What the runner cannot give us, stated rather than left to be discovered.
+# Each phrase stays on its own line so the tier A test can find it:
+#   no NVIDIA device - GPU steering never writes here
+#   no fixtures - flag 12 keeps test data out of git, so the golden group skips
+#   no second user account - G-12's two-account case is B-GEN-01, not here yet
+#   no iRacing - nothing that needs the game running is proved here
+#
+# Nothing here touches a rig, a tag or a release. It runs on the branch and on a
+# pull request, and it is allowed to fail loudly - that is the point of it.
+# Token check 2026-09-27: the N100 token holds Contents, Pull requests, Issues and
+# Workflows at write, Actions and Metadata at read, Administration read-only, Pages
+# none. This comment exists because pushing it is the only proof Workflows write
+# survived the edit - GitHub rejects the whole push otherwise.
+
+# NOTE: this file exists twice, on purpose. simracer/v4/github/workflows/tierB.yml is
+# the source of truth the build brief names; .github/workflows/tierB.yml is the only
+# path GitHub will run a workflow from, so it must be copied to .github/workflows/ to
+# run. A tier A test fails if the two drift, because a stale copy under .github is a
+# workflow that passes review and runs something else.
+
+name: tier B (Windows)
+
+on:
+  push:
+    branches: [ 'simrig/**' ]
+    paths: &tierb_paths
+      - 'simracer/v4/**'
+      # The same tree is 'app/' in the public repo, where this runs on a pull request.
+      - 'app/**'
+      # Any workflow, not just this one: a commit that only added release.yml did not
+      # run tier B, so the drift test that would have caught its missing runnable copy
+      # sat idle for a push (2026-09-27).
+      - '.github/workflows/**'
+      # And the two files that decide what a checkout even contains. .gitattributes is
+      # why the goldens compare as bytes; .gitignore is why a rules file was missing
+      # from every clone. Both changed CI behaviour today without being CI files.
+      - '.gitattributes'
+      - '.gitignore'
+  pull_request:
+    paths: *tierb_paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  lint:
+    name: PSScriptAnalyzer (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          # The private repo keeps the app at simracer/v4; the public export places it at
+          # app/. One workflow file has to run in both, so the root is resolved, never
+          # assumed. A wrong guess here fails as "file not found" three steps later.
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      - name: Install PSScriptAnalyzer
+        run: |
+          # pssa-install-start
+          # tierB on 36bd6c8 (image windows-2025-vs2026): Install-Module found no PSScriptAnalyzer,
+          # and the analyzer never ran. The version is the one of the Mac gate (1.25.0). Three tries
+          # with Install-Module, then Install-PSResource (PSResourceGet ships with pwsh 7.4 and later).
+          # It is not continue-on-error: the step is red when no way installs it, and red also when
+          # the install gave no error and the module is not there.
+          $version = '1.25.0'
+          $tries = 3
+          $installed = $false
+          foreach ($try in 1..$tries) {
+              try {
+                  Install-Module PSScriptAnalyzer -RequiredVersion $version -Force -Scope CurrentUser -SkipPublisherCheck -ErrorAction Stop
+                  $installed = $true
+                  break
+              }
+              catch {
+                  "Install PSScriptAnalyzer, try $try of ${tries}: $($_.Exception.Message)" | Write-Output
+                  if ($try -lt $tries) { Start-Sleep -Seconds 20 }
+              }
+          }
+          if (-not $installed) {
+              try {
+                  Install-PSResource -Name PSScriptAnalyzer -Version $version -Scope CurrentUser -TrustRepository -ErrorAction Stop
+                  $installed = $true
+              }
+              catch { "Install-PSResource PSScriptAnalyzer: $($_.Exception.Message)" | Write-Output }
+          }
+          if (-not $installed) { throw "PSScriptAnalyzer $version was not installed in $tries tries or with Install-PSResource" }
+          $there = @(Get-Module -ListAvailable -Name PSScriptAnalyzer | Where-Object { $_.Version -eq [version]$version })
+          if ($there.Count -eq 0) { throw "the install gave no error, and PSScriptAnalyzer $version is not there" }
+          "PSScriptAnalyzer $($there[0].Version) is installed" | Write-Output
+          # pssa-install-end
+
+      - name: Analyze
+        working-directory: ${{ steps.where.outputs.app }}
+        run: |
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0
+          $found = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Warning,Error `
+              -ExcludeRule PSUseShouldProcessForStateChangingFunctions
+          $found | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
+          "findings: $(@($found).Count)" | Write-Output
+          if (@($found).Count -gt 0) { exit 1 }
+
+  tier-a-windows:
+    name: Tier A on Windows
+    runs-on: windows-latest
+    # Each pwsh that the tests start gives plain text: on 36bd6c8 an ANSI code in a failure message stopped the NUnit
+    # XML of the run (ci-win-slash 3). The test helpers also strip the codes; this is the second guard, not the only one.
+    env:
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          # The private repo keeps the app at simracer/v4; the public export places it at
+          # app/. One workflow file has to run in both, so the root is resolved, never
+          # assumed. A wrong guess here fails as "file not found" three steps later.
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      - name: Install Pester 6
+        run: |
+          # pester-install-start
+          # TS-21. On 2026-10-02 the first attempt of run 37012201228 was red here:
+          # "No match was found for the specified search criteria and module name
+          # 'Pester'". The suite did not run, and a second attempt with no change
+          # was green. So the install has three tries. It is not continue-on-error:
+          # after three tries with an error the step is red, and it is red also
+          # when the install gave no error and Pester 6 is not there.
+          $tries = 3
+          $installed = $false
+          foreach ($try in 1..$tries) {
+              try {
+                  Install-Module Pester -MinimumVersion 6.0.0 -Force -Scope CurrentUser -SkipPublisherCheck -ErrorAction Stop
+                  $installed = $true
+                  break
+              }
+              catch {
+                  "Install Pester 6, try $try of ${tries}: $($_.Exception.Message)" | Write-Output
+                  if ($try -lt $tries) { Start-Sleep -Seconds 20 }
+              }
+          }
+          if (-not $installed) { throw "Pester 6 was not installed in $tries tries" }
+          $there = @(Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -ge [version]'6.0.0' })
+          if ($there.Count -eq 0) { throw 'the install gave no error, and Pester 6 is not there' }
+          "Pester $($there[0].Version) is installed" | Write-Output
+          # pester-install-end
+
+      - name: Run the suite
+        working-directory: ${{ steps.where.outputs.app }}
+        run: |
+          # No fixture root on purpose: the captures are not in git (flag 12), and
+          # the golden group skips itself when they are absent. A run that silently
+          # graded against absent fixtures would be worse than one that skips.
+          Import-Module Pester -MinimumVersion 6.0.0
+          $c = New-PesterConfiguration
+          $c.Run.Path = './tests'
+          $c.Run.PassThru = $true
+          $c.Output.Verbosity = 'Normal'
+          $c.TestResult.Enabled = $true
+          $c.TestResult.OutputPath = "$env:RUNNER_TEMP/tierA-windows.xml"
+          $r = Invoke-Pester -Configuration $c
+          "SUMMARY total=$($r.TotalCount) passed=$($r.PassedCount) failed=$($r.FailedCount) skipped=$($r.SkippedCount)" | Write-Output
+          foreach ($t in $r.Failed) {
+              "RED: $($t.ExpandedName)" | Write-Output
+              "     $(($t.ErrorRecord.Exception.Message -split "`n")[0])" | Write-Output
+          }
+          # verdict-start
+          # Until 2026-10-01 this step looked only at the failed count. A run that
+          # found no test, or lost half of them, has zero failures and was green.
+          # This is the only run on the platform the product ships to, so it must
+          # not be able to say "green" about nothing (TS-16).
+          #
+          # The two floors are below the real numbers on purpose (1388 passed of
+          # 1833 on 2026-10-01), so that a new test does not need an edit here.
+          # They catch a suite that did not load, not a single lost test. A tier A
+          # test runs the lines between the two markers against made-up results.
+          $floorTotal = 1700
+          $floorPassed = 1300
+          $problem = @()
+          if ($null -eq $r) { $problem += 'Pester returned no result' }
+          else {
+              if ($r.TotalCount -lt $floorTotal) { $problem += "only $($r.TotalCount) tests were found, and the floor is $floorTotal" }
+              if ($r.PassedCount -lt $floorPassed) { $problem += "only $($r.PassedCount) tests passed, and the floor is $floorPassed" }
+              if ($r.FailedCount -gt 0) { $problem += "$($r.FailedCount) test(s) failed" }
+              if ($r.FailedContainersCount -gt 0) { $problem += "$($r.FailedContainersCount) test file(s) did not load" }
+              if ($r.FailedBlocksCount -gt 0) { $problem += "$($r.FailedBlocksCount) block(s) failed" }
+          }
+          if ($problem.Count -gt 0) { throw ('tier A on Windows is red: ' + ($problem -join '; ')) }
+          # verdict-end
+
+      - name: Keep the result file
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tierA-windows
+          path: ${{ runner.temp }}/tierA-windows.xml
+          if-no-files-found: ignore
+
+  stranger-preflight:
+    name: 'B-FIRSTRUN: what a machine that is not the rig sees'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      # Every expected value in this app was measured on one rig, in one state, on
+      # 2026-09-19. The default profile is a careful GUESS at what generalises.
+      # This runner is the only machine that is not the author's: fresh Windows, no
+      # NVIDIA card, no wheel, no sim, and no machine-specific profile, so it gets
+      # 'default', as a first-time user does.
+      #
+      # This job runs the REAL console, installed by the REAL installer. Until
+      # 2026-10-01 it ran its own short copy of the startup, and the copy was wrong:
+      # it gave the raw quiet-list data to the preflight, it did not read the
+      # machine or choose a profile, and it left out a mandatory parameter. Every
+      # step had continue-on-error, so the job was green and made nothing. Nobody
+      # had looked at its output.
+      #
+      # Two rules now:
+      #   - the job makes a picture, so the job is RED when there is no picture
+      #   - it does NOT grade the check rows. A VM in a datacentre is not a gaming
+      #     PC, and a failed row here mostly means "it is a VM". The picture and the
+      #     text are for a person to read.
+      - name: Stage a release folder
+        id: stage
+        run: |
+          # Not under RUNNER_TEMP: the installer refuses a temporary folder.
+          $src = Join-Path $env:GITHUB_WORKSPACE 'first-run-stage'
+          Copy-Item -Path '${{ steps.where.outputs.app }}' -Destination $src -Recurse
+          Remove-Item -LiteralPath (Join-Path $src 'tests') -Recurse -Force -ErrorAction SilentlyContinue
+          "src=$src" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Write SHA256SUMS and VERSIONS.md
+        run: |
+          pwsh -NoProfile -File '${{ steps.where.outputs.app }}/tools/New-SimRigManifest.ps1' `
+              -SourcePath '${{ steps.stage.outputs.src }}' `
+              -Version '4.2.0-ci' -Commit $env:GITHUB_SHA.Substring(0,7)
+          if ($LASTEXITCODE -ne 0) { throw "manifest not written (exit $LASTEXITCODE)" }
+
+      - name: Install it, the way a user does
+        run: |
+          # The console refuses to run from a folder that a standard user can write
+          # to, and a plain checkout is such a folder. The installer sets the
+          # permissions. A first-time user has an installed app, so this job does too.
+          $install = Join-Path $env:GITHUB_WORKSPACE 'first-run-install'
+          $data = Join-Path $env:GITHUB_WORKSPACE 'first-run-data'
+          pwsh -NoProfile -File (Join-Path '${{ steps.stage.outputs.src }}' 'Install-SimRig.ps1') `
+              -SourcePath '${{ steps.stage.outputs.src }}' -InstallRoot $install -DataRoot $data `
+              -SessionRoot $data -PackageVersion '4.2.0-ci' -SkipPrerequisiteInstall
+          if ($LASTEXITCODE -ne 0) { throw "install refused or failed (exit $LASTEXITCODE)" }
+
+      - name: Open the installed console and let it photograph itself
+        run: |
+          $install = Join-Path $env:GITHUB_WORKSPACE 'first-run-install'
+          $data = Join-Path $env:GITHUB_WORKSPACE 'first-run-data'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'first-run'
+          [void](New-Item -ItemType Directory -Path $out -Force)
+          pwsh -NoProfile -STA -ExecutionPolicy Bypass -File (Join-Path $install 'SimRigConsole.ps1') `
+              -Root $data -NasRoot '' `
+              -StartupReport (Join-Path $out 'first-run-startup.json') `
+              -StartupPicture (Join-Path $out 'first-run-window.png')
+          "console exit: $LASTEXITCODE" | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "the console did not close normally (exit $LASTEXITCODE)" }
+
+      - name: Write what it saw, and fail when the output is not there
+        if: always()
+        run: |
+          $data = Join-Path $env:GITHUB_WORKSPACE 'first-run-data'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'first-run'
+          [void](New-Item -ItemType Directory -Path $out -Force)
+          $text = Join-Path $out 'first-run.txt'
+          "B-FIRSTRUN on $env:RUNNER_OS, commit $env:GITHUB_SHA, run $env:GITHUB_RUN_ID, $(Get-Date -Format o)" | Out-File $text
+
+          $log = @(Get-ChildItem -LiteralPath (Join-Path $data 'Logs/v4') -Filter 'console_*.log' -File -Recurse -ErrorAction SilentlyContinue |
+              Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1)
+          '' | Out-File $text -Append
+          '--- console log ---' | Out-File $text -Append
+          if ($log.Count -gt 0) { Get-Content -LiteralPath $log[0].FullName | Out-File $text -Append }
+          else { 'the console wrote no log' | Out-File $text -Append }
+
+          $problem = [System.Collections.Generic.List[string]]::new()
+          $reportPath = Join-Path $out 'first-run-startup.json'
+          $picturePath = Join-Path $out 'first-run-window.png'
+          $doc = $null
+          '' | Out-File $text -Append
+          '--- startup report ---' | Out-File $text -Append
+          if (Test-Path -LiteralPath $reportPath) {
+              $raw = Get-Content -LiteralPath $reportPath -Raw
+              $raw | Out-File $text -Append
+              $doc = $raw | ConvertFrom-Json
+              $preflight = [string]$doc.Preflight
+              if ($preflight -match '^(failed|not run)') { $problem.Add("the preflight did not run on this machine: $preflight") }
+              $picture = if ($doc.PSObject.Properties['Picture']) { [string]$doc.Picture } else { 'the report has no Picture field' }
+              if ($picture -notmatch '^saved: ') { $problem.Add("the console did not save the picture: $picture") }
+          }
+          else { $problem.Add('the console wrote no startup report') }
+
+          if (Test-Path -LiteralPath $picturePath) {
+              $size = (Get-Item -LiteralPath $picturePath).Length
+              "picture: $size bytes" | Out-File $text -Append
+              # A PNG of a window with text in it is far above this. A file this small
+              # is an empty or a one-colour image.
+              if ($size -lt 10000) { $problem.Add("the picture is only $size bytes: an empty window, not a console") }
+          }
+          else { $problem.Add('there is no picture file') }
+
+          # layout-start
+          # RF-3. On 2026-09-30 and 2026-10-01 this job was green with a picture
+          # where the banner filled the window, the banner text was in a column of
+          # about 25 px, and no check row was seen. A script cannot read a picture.
+          # So the console writes the sizes that it measured (the field Layout of
+          # the report), and these lines are red for a first screen that hides the
+          # list of what to do. A tier A test runs the lines between the two
+          # markers against made-up reports. It needs $doc and $problem.
+          #
+          # What these numbers do not see: a row that is in view and is behind
+          # another element. A person must look at the picture.
+          $layout = if ($null -ne $doc -and $doc.PSObject.Properties['Layout']) { $doc.Layout } else { $null }
+          if ($null -eq $layout -or $layout -is [string] -or $layout -is [array]) {
+              $problem.Add('layout: the report has no Layout field with the measured sizes')
+          }
+          else {
+              $measured = @{}
+              foreach ($name in 'WindowHeight', 'BannerHeight', 'BannerTextWidth', 'BannerButtons', 'BannerButtonsInView', 'CheckRows', 'CheckRowsInView') {
+                  $value = if ($layout.PSObject.Properties[$name]) { $layout.$name } else { '(no field)' }
+                  if ($value -is [int] -or $value -is [long] -or $value -is [double] -or $value -is [decimal]) { $measured[$name] = [double]$value }
+                  else { $problem.Add("layout: $name was not measured: $value") }
+              }
+              $flag = @{}
+              foreach ($name in 'SubtitleTrimmed', 'BannerTitleTrimmed', 'BannerTextScrolls') {
+                  $value = if ($layout.PSObject.Properties[$name]) { $layout.$name } else { '(no field)' }
+                  if ($value -is [bool]) { $flag[$name] = $value }
+                  else { $problem.Add("layout: $name was not measured: $value") }
+              }
+              if ($measured.ContainsKey('CheckRows') -and $measured.CheckRows -lt 20) { $problem.Add("layout: the check list has only $($measured.CheckRows) rows, and the limit is 20") }
+              if ($measured.ContainsKey('CheckRowsInView') -and $measured.CheckRowsInView -lt 3) { $problem.Add("layout: only $($measured.CheckRowsInView) check rows are in view, and the limit is 3") }
+              if ($measured.ContainsKey('BannerHeight') -and $measured.ContainsKey('WindowHeight') -and $measured.BannerHeight -gt (0.4 * $measured.WindowHeight)) {
+                  $problem.Add("layout: the banner is $($measured.BannerHeight) high in a window of $($measured.WindowHeight), and the limit is 40 percent")
+              }
+              if ($measured.ContainsKey('BannerTextWidth') -and $measured.BannerTextWidth -lt 300) { $problem.Add("layout: the banner text is only $($measured.BannerTextWidth) wide, and the limit is 300") }
+              if ($measured.ContainsKey('BannerButtons') -and $measured.BannerButtons -lt 1) { $problem.Add('layout: the banner has no visible button') }
+              # Blocker 4, push 1 of the unit tune. The runner is never the rig, so its first
+              # screen has the 6 buttons with no tuning button: Start anyway, Start anyway with
+              # capture tools, Re-check, Undo every change this app made, Dry run, Open log.
+              # With Apply tuning and Undo tuning it is 8. This is the check of the console
+              # line that hides the tuning buttons on a PC that is not the rig.
+              if ($measured.ContainsKey('BannerButtons') -and $measured.BannerButtons -ge 1 -and $measured.BannerButtons -ne 6) {
+                  $problem.Add("layout: the banner has $($measured.BannerButtons) buttons, and a PC that is not the rig has 6, with no tuning button")
+              }
+              if ($measured.ContainsKey('BannerButtons') -and $measured.ContainsKey('BannerButtonsInView') -and $measured.BannerButtonsInView -ne $measured.BannerButtons) {
+                  $problem.Add("layout: $($measured.BannerButtonsInView) of $($measured.BannerButtons) banner buttons are inside the window")
+              }
+              foreach ($name in 'SubtitleTrimmed', 'BannerTitleTrimmed', 'BannerTextScrolls') {
+                  if ($flag.ContainsKey($name) -and $flag[$name]) { $problem.Add("layout: $name is true, so a text is not shown in full") }
+              }
+          }
+          # layout-end
+
+          '' | Out-File $text -Append
+          '--- result ---' | Out-File $text -Append
+          if ($problem.Count -eq 0) { 'output complete. A person must look at the picture.' | Out-File $text -Append }
+          foreach ($p in $problem) { "PROBLEM: $p" | Out-File $text -Append }
+          Get-Content -LiteralPath $text | Write-Output
+          if ($problem.Count -gt 0) { throw ('{0} problem(s) with the first-run output: {1}' -f $problem.Count, ($problem -join '; ')) }
+
+      - name: Keep it
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: first-run-on-a-stock-machine
+          path: first-run/
+          if-no-files-found: error
+
+  manifest-and-install:
+    name: 'B-INST: manifest, install, upgrade, uninstall'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          # The private repo keeps the app at simracer/v4; the public export places it at
+          # app/. One workflow file has to run in both, so the root is resolved, never
+          # assumed. A wrong guess here fails as "file not found" three steps later.
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      - name: Stage a release folder
+        id: stage
+        run: |
+          # Not under RUNNER_TEMP: the installer refuses to run from a temporary
+          # folder, because Windows can empty one part way through a copy. That
+          # refusal is a feature, so the test respects it instead of bypassing it.
+          $src = Join-Path $env:GITHUB_WORKSPACE 'ci-stage'
+          Copy-Item -Path '${{ steps.where.outputs.app }}' -Destination $src -Recurse
+          Remove-Item -LiteralPath (Join-Path $src 'tests') -Recurse -Force -ErrorAction SilentlyContinue
+          "src=$src" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Write SHA256SUMS and VERSIONS.md
+        run: |
+          pwsh -NoProfile -File '${{ steps.where.outputs.app }}/tools/New-SimRigManifest.ps1' `
+              -SourcePath '${{ steps.stage.outputs.src }}' `
+              -Version '4.2.0-ci' -Commit $env:GITHUB_SHA.Substring(0,7)
+          if ($LASTEXITCODE -ne 0) { throw "manifest not written (exit $LASTEXITCODE)" }
+          Get-Content -LiteralPath (Join-Path '${{ steps.stage.outputs.src }}' 'SHA256SUMS') -TotalCount 4 | Write-Output
+
+      - name: B-INST-01 - clean install
+        run: |
+          $install = Join-Path $env:GITHUB_WORKSPACE 'ci-install'
+          $data = Join-Path $env:GITHUB_WORKSPACE 'ci-data'
+          pwsh -NoProfile -File (Join-Path '${{ steps.stage.outputs.src }}' 'Install-SimRig.ps1') `
+              -SourcePath '${{ steps.stage.outputs.src }}' -InstallRoot $install -DataRoot $data `
+              -SessionRoot $data -PackageVersion '4.2.0-ci' -SkipPrerequisiteInstall
+          "exit: $LASTEXITCODE" | Write-Output
+          if ($LASTEXITCODE -ne 0) { throw "install refused or failed (exit $LASTEXITCODE)" }
+          foreach ($name in 'SimRigConsole.ps1', 'SimRig.Engine.ps1', 'Setup.cmd', 'SHA256SUMS', 'VERSIONS.md', 'README.md') {
+              if (-not (Test-Path -LiteralPath (Join-Path $install $name))) { throw "install did not copy $name" }
+          }
+          foreach ($dir in 'engine', 'discover', 'rules', 'profiles') {
+              if (-not (Test-Path -LiteralPath (Join-Path $install $dir))) { throw "install did not copy $dir\" }
+          }
+          "install ok: $install" | Write-Output
+
+      - name: B-INST-02 - in-place upgrade keeps the user data
+        run: |
+          $install = Join-Path $env:GITHUB_WORKSPACE 'ci-install'
+          $data = Join-Path $env:GITHUB_WORKSPACE 'ci-data'
+          # Something of the user's, in each of the places the plan promises to keep.
+          $sessions = Join-Path $data 'Logs\v4\sessions\2026-01-01_0000'
+          [void](New-Item -ItemType Directory -Path $sessions -Force)
+          Set-Content -LiteralPath (Join-Path $sessions 'result.json') -Value '{"kept":true}'
+          Set-Content -LiteralPath (Join-Path $install 'settings.json') -Value '{"Schema":"simrig.settings/2","Version":2,"SavePath":{"Session":"D:\\keep"},"Tools":{}}'
+
+          pwsh -NoProfile -File (Join-Path '${{ steps.stage.outputs.src }}' 'Install-SimRig.ps1') `
+              -SourcePath '${{ steps.stage.outputs.src }}' -InstallRoot $install -DataRoot $data `
+              -SessionRoot $data -PackageVersion '4.2.0-ci2' -SkipPrerequisiteInstall
+          if ($LASTEXITCODE -ne 0) { throw "upgrade refused or failed (exit $LASTEXITCODE)" }
+          if (-not (Test-Path -LiteralPath (Join-Path $sessions 'result.json'))) { throw 'the upgrade removed a session' }
+          $settings = Get-Content -LiteralPath (Join-Path $install 'settings.json') -Raw
+          if ($settings -notmatch 'D:\\\\keep') { throw 'the upgrade overwrote settings.json' }
+          'upgrade kept the sessions and the settings' | Write-Output
+
+      - name: B-INST-02b - an upgrade is refused while a session is open
+        run: |
+          $install = Join-Path $env:GITHUB_WORKSPACE 'ci-install'
+          $data = Join-Path $env:GITHUB_WORKSPACE 'ci-data'
+          $marker = Join-Path $data 'Logs\v4\active-session.json'
+          [void](New-Item -ItemType Directory -Path (Split-Path $marker -Parent) -Force)
+          Set-Content -LiteralPath $marker -Value '{"Schema":"simrig.active-session/1","SessionId":"ci"}'
+          pwsh -NoProfile -File (Join-Path '${{ steps.stage.outputs.src }}' 'Install-SimRig.ps1') `
+              -SourcePath '${{ steps.stage.outputs.src }}' -InstallRoot $install -DataRoot $data `
+              -SessionRoot $data -SkipPrerequisiteInstall
+          $code = $LASTEXITCODE
+          Remove-Item -LiteralPath $marker -Force
+          if ($code -ne 3) { throw "expected refusal (3) while a session is open, got $code" }
+          'refused while a session was open' | Write-Output
+          # A pwsh step fails on the last exit code, and the last thing that ran here
+          # exited 3 on purpose. Without this the step reported failure for the exact
+          # behaviour it was asserting - which is how this job stayed red after the
+          # install itself started passing.
+          exit 0
+
+      - name: B-INST-03 - uninstall removes the program and keeps the data
+        run: |
+          $install = Join-Path $env:GITHUB_WORKSPACE 'ci-install'
+          $data = Join-Path $env:GITHUB_WORKSPACE 'ci-data'
+          pwsh -NoProfile -File (Join-Path $install 'Install-SimRig.ps1') -Uninstall `
+              -InstallRoot $install -DataRoot $data -SessionRoot $data
+          "exit: $LASTEXITCODE" | Write-Output
+          if (Test-Path -LiteralPath (Join-Path $install 'SimRigConsole.ps1')) { throw 'uninstall left the program behind' }
+          if (-not (Test-Path -LiteralPath (Join-Path $data 'Logs\v4\sessions\2026-01-01_0000\result.json'))) {
+              throw 'uninstall took a session with it'
+          }
+          'uninstall removed the program and kept the sessions' | Write-Output
+
+  round-trip:
+    name: 'B-FIX-03: quiet, verify, restore, verify'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          # The private repo keeps the app at simracer/v4; the public export places it at
+          # app/. One workflow file has to run in both, so the root is resolved, never
+          # assumed. A wrong guess here fails as "file not found" three steps later.
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      - name: Quiet a small set, read it back, restore it, read it back
+        working-directory: ${{ steps.where.outputs.app }}
+        run: |
+          # A deliberately small tick set. The full list disables Windows Update and
+          # switches off Defender real-time, and a runner that quiets all of that
+          # mid-job can stop being a working runner - the failure would then look
+          # like our bug. Two services and one task prove the same path: snapshot,
+          # write, read back, restore, read back.
+          $only = 'Service:WSearch|Service:SysMain'
+          $root = Join-Path $env:GITHUB_WORKSPACE 'ci-rig'
+          $session = Join-Path $root 'Logs\v4\sessions\ci'
+          $rid = [guid]::NewGuid().ToString()
+
+          $before = Get-Service -Name WSearch, SysMain -ErrorAction SilentlyContinue |
+              Select-Object Name, StartType, Status
+          $before | Format-Table -AutoSize | Out-String | Write-Output
+
+          pwsh -NoProfile -File ./SimRig.Actions.ps1 -Operation Quiet -RequestId $rid `
+              -SessionDir $session -Root $root -OnlyId $only
+          "quiet exit: $LASTEXITCODE" | Write-Output
+          $quiet = Get-Content -LiteralPath (Join-Path $root "Logs\v4\results\Quiet-$rid.json") -Raw | ConvertFrom-Json
+          "quiet ok=$($quiet.Ok) steps=$(@($quiet.Steps).Count) errors=$(@($quiet.Errors).Count)" | Write-Output
+          foreach ($e in @($quiet.Errors)) { "  error: $e" | Write-Output }
+
+          $mid = Get-Service -Name WSearch, SysMain -ErrorAction SilentlyContinue | Select-Object Name, StartType, Status
+          $mid | Format-Table -AutoSize | Out-String | Write-Output
+          if (@($mid | Where-Object { $_.StartType -ne 'Disabled' }).Count -gt 0) {
+              throw 'quiet did not disable both services on real Windows'
+          }
+
+          $rid2 = [guid]::NewGuid().ToString()
+          pwsh -NoProfile -File ./SimRig.Actions.ps1 -Operation Restore -RequestId $rid2 -Root $root
+          "restore exit: $LASTEXITCODE" | Write-Output
+          $restore = Get-Content -LiteralPath (Join-Path $root "Logs\v4\results\Restore-$rid2.json") -Raw | ConvertFrom-Json
+          "restore ok=$($restore.Ok) green=$($restore.Verdict.Green) line=$($restore.Verdict.Line)" | Write-Output
+          foreach ($e in @($restore.Errors)) { "  error: $e" | Write-Output }
+
+          $after = Get-Service -Name WSearch, SysMain -ErrorAction SilentlyContinue | Select-Object Name, StartType, Status
+          $after | Format-Table -AutoSize | Out-String | Write-Output
+
+          # The snapshot is the contract: every start type back to what it was.
+          foreach ($svc in $before) {
+              $now = $after | Where-Object { $_.Name -eq $svc.Name }
+              if ($now.StartType -ne $svc.StartType) {
+                  throw "$($svc.Name) came back as $($now.StartType), was $($svc.StartType)"
+              }
+          }
+          if (-not $restore.Verdict.Green) { throw 'restore was not green on real Windows' }
+          'round trip green on real Windows' | Write-Output
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: round-trip-logs
+          path: ci-rig/Logs/v4
+          if-no-files-found: warn
+
+  console-start:
+    name: The console starts (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          # The private repo keeps the app at simracer/v4; the public export places it at
+          # app/. One workflow file has to run in both, so the root is resolved, never
+          # assumed. A wrong guess here fails as "file not found" three steps later.
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      - name: Open the console with -StartupReport, the way the self-test does
+        shell: cmd
+        run: >
+          pwsh -NoProfile -STA -ExecutionPolicy Bypass
+          -File "${{ steps.where.outputs.app }}\SimRigConsole.ps1"
+          -Root "%RUNNER_TEMP%\ConsoleStart"
+          -NasRoot ""
+          -StartupReport "%RUNNER_TEMP%\startup.json"
+
+      - name: Read what it wrote, and its own log
+        shell: pwsh
+        run: |
+          # The console is a GUI app, but -StartupReport makes it close itself once
+          # the preflight is on screen - that is how the self-test times it. So a
+          # runner can answer the one question no other job asks: does the app OPEN?
+          #
+          # It exists because on 2026-09-28 the release candidate did not. The
+          # self-test said "no startup report (console exit 1)" and Rick could not
+          # carry on. Nothing in tier A, tier B or the screenshot render builds the
+          # whole console and runs its startup path.
+          $log = @(Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'ConsoleStart/Logs/v4') -Filter 'console_*.log' -File -Recurse -ErrorAction SilentlyContinue |
+              Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1)
+          if ($log.Count -gt 0) {
+              '--- console log ---' | Write-Output
+              Get-Content -LiteralPath $log[0].FullName | Write-Output
+          }
+          else { 'the console wrote no log at all' | Write-Output }
+
+          $report = Join-Path $env:RUNNER_TEMP 'startup.json'
+          if (-not (Test-Path -LiteralPath $report)) {
+              throw 'the console did not write a startup report: it failed before the preflight reached the screen'
+          }
+          $doc = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
+          '--- startup report ---' | Write-Output
+          $doc | ConvertTo-Json -Depth 5 | Write-Output
+
+          # This run gave no -StartupPicture. So the report must have no Picture
+          # field and no PNG may exist: without the switch the console does what it
+          # did before the switch existed. This is the only place that runs the real
+          # console without it and looks.
+          if ($doc.PSObject.Properties['Picture']) { throw 'the report has a Picture field, and no picture was asked for' }
+          $stray = @(Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP 'ConsoleStart') -Filter '*.png' -File -Recurse -ErrorAction SilentlyContinue)
+          if ($stray.Count -gt 0) { throw ('the console made {0} PNG file(s), and no picture was asked for' -f $stray.Count) }
+
+      # Blocker 6, commit 5 (open rows O1 and O7 of meta/changes/2026-10-07-simrig-v4.2-blocker6.md).
+      # A measure, not a check: it writes what Windows does to the artifact, and it is
+      # red only when that output is missing or not complete. The console makes
+      # C:\SimRacer\Logs\v4 itself, as on a tester's PC; the installer sets no ACL there.
+      - name: 'Blocker 6 measure: the console makes C:\SimRacer, the way a first start does'
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'blocker6-measure'
+          [void](New-Item -ItemType Directory -Path $out -Force)
+          pwsh -NoProfile -STA -ExecutionPolicy Bypass -File '${{ steps.where.outputs.app }}\SimRigConsole.ps1' `
+              -Root 'C:\SimRacer' -NasRoot '' -StartupReport (Join-Path $out 'startup.json')
+          "console exit: $LASTEXITCODE" | Write-Output
+          if (-not (Test-Path -LiteralPath 'C:\SimRacer\Logs\v4')) { throw 'the console did not make C:\SimRacer\Logs\v4' }
+
+      - name: 'Blocker 6 measure: the ACL, and the write of the record through a link'
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'blocker6-measure'
+          $text = Join-Path $out 'measure.txt'
+          "Blocker 6 measure, commit $env:GITHUB_SHA, run $env:GITHUB_RUN_ID, user $env:USERNAME, $(Get-Date -Format o)" | Out-File $text
+          foreach ($folder in 'C:\SimRacer', 'C:\SimRacer\Logs\v4') {
+              "icacls $folder" | Out-File $text -Append
+              (& icacls $folder 2>&1 | Out-String).TrimEnd() | Out-File $text -Append
+              "icacls exit: $LASTEXITCODE" | Out-File $text -Append
+          }
+          $sessions = 'C:\SimRacer\Logs\v4\sessions'
+          [void](New-Item -ItemType Directory -Path $sessions -Force)
+
+          # 1. A session folder that is a junction to a folder that is not there. The write is
+          # the one of Write-JsonFileAtomic: <path>.tmp with File.WriteAllText, then Move-Item.
+          $gone = 'C:\simrig-measure-gone'
+          [void](New-Item -ItemType Directory -Path $gone -Force)
+          $junction = Join-Path $sessions 'measure-junction'
+          [void](New-Item -ItemType Junction -Path $junction -Target $gone)
+          Remove-Item -LiteralPath $gone -Recurse -Force
+          $record = Join-Path $junction 'tuning-snapshot.json'
+          try {
+              [System.IO.File]::WriteAllText($record + '.tmp', '{}', [System.Text.UTF8Encoding]::new($false))
+              Move-Item -LiteralPath ($record + '.tmp') -Destination $record -Force
+              $result = 'written'
+          }
+          catch { $result = 'error: ' + ($_.Exception.Message -replace '\s+', ' ') }
+          "junction-write: $result" | Out-File $text -Append
+          "junction-write: the folder of the target is there after: $(Test-Path -LiteralPath $gone)" | Out-File $text -Append
+
+          # 2. A record file that is a symbolic link to a file that is not there.
+          $folder = Join-Path $sessions 'measure-filelink'
+          [void](New-Item -ItemType Directory -Path $folder -Force)
+          $target = 'C:\simrig-measure-target.json'
+          $link = Join-Path $folder 'tuning-snapshot.json'
+          [void](New-Item -ItemType SymbolicLink -Path $link -Target $target)
+          try {
+              [System.IO.File]::WriteAllText($link + '.tmp', '{}', [System.Text.UTF8Encoding]::new($false))
+              Move-Item -LiteralPath ($link + '.tmp') -Destination $link -Force
+              $result = 'written'
+          }
+          catch { $result = 'error: ' + ($_.Exception.Message -replace '\s+', ' ') }
+          "filelink-write: $result" | Out-File $text -Append
+          "filelink-write: the target file is there after: $(Test-Path -LiteralPath $target)" | Out-File $text -Append
+          $after = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+          "filelink-write: the record is a link after: $(if ($null -eq $after) { 'not there' } else { [string]$after.Attributes -match 'ReparsePoint' })" | Out-File $text -Append
+
+          Get-Content -LiteralPath $text | Write-Output
+          # Red only when the output is not complete: each line that the record cites is there.
+          $lines = Get-Content -LiteralPath $text
+          $missing = @('icacls C:\SimRacer', 'icacls C:\SimRacer\Logs\v4', 'junction-write: ', 'filelink-write: ' | Where-Object {
+                  $start = $_
+                  @($lines | Where-Object { $_.StartsWith($start) }).Count -eq 0
+              })
+          if ($missing.Count -gt 0) { throw ('the measure output has no line for: ' + ($missing -join ', ')) }
+          if (@($lines | Where-Object { $_ -match '^icacls exit: 0$' }).Count -ne 2) { throw 'icacls did not read both folders' }
+
+      - name: 'Blocker 6 measure: keep the output'
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blocker6-measure
+          path: blocker6-measure/
+          if-no-files-found: error
+
+  # Blocker 2, push A, test P13: the standalone restore from an extracted copy, on a real
+  # Windows. RESTORE-NOW.cmd runs from a staged release folder with its own SHA256SUMS, the
+  # way a tester runs it from the folder of the zip, with no console. The data root is the
+  # fixed C:\SimRacer of RESTORE-NOW.cmd. The runner is an administrator, so the Windows
+  # prompt of -Verb RunAs is not shown here: the prompt for a standard user is not proved.
+  restore-now:
+    name: 'B-P13: RESTORE-NOW.cmd from an extracted copy, with no console'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Where is the app in this checkout
+        id: where
+        shell: bash
+        run: |
+          if [ -d simracer/v4 ]; then echo "app=simracer/v4" >> "$GITHUB_OUTPUT"
+          elif [ -d app ]; then echo "app=app" >> "$GITHUB_OUTPUT"
+          else echo "no app folder in this checkout: looked for simracer/v4 and app" >&2; exit 1; fi
+
+      - name: Stage a release folder, with SHA256SUMS and VERSIONS.md
+        id: stage
+        run: |
+          # Not under RUNNER_TEMP: a tester extracts the zip to a real folder.
+          $src = Join-Path $env:GITHUB_WORKSPACE 'restore-now-stage'
+          Copy-Item -Path '${{ steps.where.outputs.app }}' -Destination $src -Recurse
+          Remove-Item -LiteralPath (Join-Path $src 'tests') -Recurse -Force -ErrorAction SilentlyContinue
+          pwsh -NoProfile -File '${{ steps.where.outputs.app }}/tools/New-SimRigManifest.ps1' `
+              -SourcePath $src -Version '4.2.0-ci' -Commit $env:GITHUB_SHA.Substring(0,7)
+          if ($LASTEXITCODE -ne 0) { throw "manifest not written (exit $LASTEXITCODE)" }
+          "src=$src" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: 'P13: with no Quiet first, then a Quiet, RESTORE-NOW.cmd puts each item back'
+        run: |
+          $stage = '${{ steps.stage.outputs.src }}'
+          $cmd = Join-Path $stage 'RESTORE-NOW.cmd'
+          $root = 'C:\SimRacer'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'restore-now-out'
+          [void](New-Item -ItemType Directory -Path $out -Force)
+          $problems = [System.Collections.Generic.List[string]]::new()
+          $marker = Join-Path $root 'Logs\v4\active-session.json'
+
+          # 1. No marker: nothing to restore, and no word typed (stdin is empty), so no change.
+          # A run that is green here with no work is the state that this part proves is not
+          # taken for a restore.
+          $p = Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c ""{0}" <nul >"{1}" 2>&1"' -f $cmd, (Join-Path $out 'no-quiet.txt')) -Wait -PassThru -NoNewWindow
+          "no-quiet exit: $($p.ExitCode)" | Out-File (Join-Path $out 'exit-codes.txt') -Append
+          $text = Get-Content -LiteralPath (Join-Path $out 'no-quiet.txt') -Raw
+          if ($p.ExitCode -ne 0) { $problems.Add("no-quiet: exit $($p.ExitCode), expected 0") }
+          if ($text -notmatch 'No open session and no applied tuning were found\. Nothing to restore\.') { $problems.Add('no-quiet: no W1 line') }
+          # W4 as a whole line: W5 has the same sentence inside a longer line (REVIEW-blocker2-37c7e46.md finding 20).
+          if ($text -notmatch '(?m)^\s*No change was made\.\s*$') { $problems.Add('no-quiet: no W4 line') }
+          if ($text -match 'could not count the items') { $problems.Add('no-quiet: W5 (no valid dry run) in place of W4') }
+          if ($text -match 'Done\. Windows is back') { $problems.Add('no-quiet: S13 with no session') }
+
+          # 2. A Quiet of a small set, the same set as the round-trip job.
+          $only = 'Service:WSearch|Service:SysMain'
+          $before = Get-Service -Name WSearch, SysMain -ErrorAction SilentlyContinue | Select-Object Name, StartType, Status
+          $before | Format-Table -AutoSize | Out-String | Out-File (Join-Path $out 'services.txt')
+          if (@($before).Count -ne 2) { $problems.Add("the runner has $(@($before).Count) of the 2 services, so the compare would be empty") }
+          $rid = [guid]::NewGuid().ToString()
+          pwsh -NoProfile -File (Join-Path $stage 'SimRig.Actions.ps1') -Operation Quiet -RequestId $rid `
+              -SessionDir "$root\Logs\v4\sessions\ci" -Root $root -OnlyId $only
+          $quietCode = $LASTEXITCODE
+          "quiet exit: $quietCode" | Out-File (Join-Path $out 'exit-codes.txt') -Append
+          if ($quietCode -ne 0) { $problems.Add("quiet: exit $quietCode, expected 0") }
+          $mid = Get-Service -Name WSearch, SysMain -ErrorAction SilentlyContinue | Select-Object Name, StartType, Status
+          $mid | Format-Table -AutoSize | Out-String | Out-File (Join-Path $out 'services.txt') -Append
+          if (@($mid | Where-Object { $_.StartType -ne 'Disabled' }).Count -gt 0) { $problems.Add('quiet did not disable both services') }
+          if (-not (Test-Path -LiteralPath $marker)) { $problems.Add('quiet wrote no marker') }
+          if ($null -eq (Get-ScheduledTask -TaskPath '\SimRig\' -TaskName 'SimRigV4-Deadman' -ErrorAction SilentlyContinue)) { $problems.Add('quiet registered no deadman task') }
+
+          # 3. RESTORE-NOW.cmd from the staged folder.
+          $p = Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c ""{0}" <nul >"{1}" 2>&1"' -f $cmd, (Join-Path $out 'restore.txt')) -Wait -PassThru -NoNewWindow
+          "restore exit: $($p.ExitCode)" | Out-File (Join-Path $out 'exit-codes.txt') -Append
+          $text = Get-Content -LiteralPath (Join-Path $out 'restore.txt') -Raw
+          $after = Get-Service -Name WSearch, SysMain -ErrorAction SilentlyContinue | Select-Object Name, StartType, Status
+          $after | Format-Table -AutoSize | Out-String | Out-File (Join-Path $out 'services.txt') -Append
+          if ($p.ExitCode -ne 0) { $problems.Add("restore: exit $($p.ExitCode), expected 0") }
+          if ($text -notmatch 'An open session was found') { $problems.Add('restore: no S6 line') }
+          if ($text -match 'NOT FINISHED') { $problems.Add('restore: NOT FINISHED') }
+          if ($text -notmatch 'Done\. Windows is back to the values from before the session\.') { $problems.Add('restore: no S13 line') }
+          if ($text -notmatch 'The log of this run is in') { $problems.Add('restore: no E1 line') }
+          foreach ($svc in $before) {
+              $now = $after | Where-Object { $_.Name -eq $svc.Name }
+              if ($now.StartType -ne $svc.StartType) { $problems.Add("$($svc.Name) came back as $($now.StartType), was $($svc.StartType)") }
+          }
+          if (Test-Path -LiteralPath $marker) { $problems.Add('the marker is still there after the restore') }
+          if ($null -ne (Get-ScheduledTask -TaskPath '\SimRig\' -TaskName 'SimRigV4-Deadman' -ErrorAction SilentlyContinue)) { $problems.Add('the deadman task is still there after the restore') }
+          $log = Join-Path $root 'Logs\v4\restore-now.log'
+          if (-not (Test-Path -LiteralPath $log)) { $problems.Add('no restore-now.log') }
+
+          Copy-Item -LiteralPath (Join-Path $root 'Logs\v4') -Destination (Join-Path $out 'logs') -Recurse -ErrorAction SilentlyContinue
+          $problems | Out-File (Join-Path $out 'problems.txt')
+          Get-Content -LiteralPath (Join-Path $out 'restore.txt') | Write-Output
+          if ($problems.Count -gt 0) { throw ('P13: ' + ($problems -join '; ')) }
+          'P13 green: RESTORE-NOW.cmd restored a real Quiet from an extracted copy' | Write-Output
+
+      - name: 'P13: keep the output'
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-now
+          path: restore-now-out/
+          if-no-files-found: error
