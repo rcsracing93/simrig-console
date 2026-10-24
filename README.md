@@ -26,6 +26,18 @@ In this beta the About screen, and the My PC, Gaps, Score, Share and First run s
 
 On a first run the app will almost certainly say NOT READY. That is the normal result. The check compares your PC with a known good state for a race, and a PC that nobody has set up for racing does not match it. The rows under the banner list each check. The checks that differ come first.
 
+## Screenshots
+
+These two pictures come from a test run of the app on a Windows virtual machine, not from a racing PC. On your PC the numbers and the rows will differ.
+
+![SimRig Console after a dry run: 79 changes planned, machine state unchanged](https://raw.githubusercontent.com/rcsracing93/simrig-console/main/docs/screenshots/simrig-dry-run.png)
+
+A dry run. The app lists the changes that Quiet would make, and reports that the PC is unchanged.
+
+![SimRig Console showing NOT READY with a list of failed checks](https://raw.githubusercontent.com/rcsracing93/simrig-console/main/docs/screenshots/simrig-not-ready.png)
+
+NOT READY. On a first run the app will almost certainly say this. The list starts with the checks that failed.
+
 ## What it does
 
 **Preflight.** Reads the machine and grades it against a set of rules. Each rule has a note that says where its value came from. A row says what was found and where it was read.
